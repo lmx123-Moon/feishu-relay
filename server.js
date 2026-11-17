@@ -5,8 +5,19 @@ const http = require('http');
 const https = require('https');
 
 const PORT = process.env.PORT || 8787;
-const UPSTREAM = 'open.feishu.cn';
-const ALLOW_RE = /^\/open-apis\//;
+/* 允许的上游：open.feishu.cn 的 /open-apis/*，以及 accounts.feishu.cn 的 /oauth/v3/token（新版令牌端点） */
+const HOSTS = { open: 'open.feishu.cn', accounts: 'accounts.feishu.cn' };
+const ALLOW = [
+  { host: 'open',     re: /^\/open-apis\// },
+  { host: 'accounts', re: /^\/oauth\/v3\/token$/ }
+];
+function resolveTarget(payload){
+  const want = String(payload.host || 'open');
+  const path = String(payload.path || '');
+  const rules = ALLOW.filter(r => r.host === want);
+  const hit = rules.find(r => r.re.test(path));
+  return hit ? { hostname: HOSTS[hit.host], path } : null;
+}
 
 const CALLBACK_HTML = `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
@@ -67,14 +78,18 @@ function cors(res){
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
-function forward(payload, cb){
-  const path = String(payload.path || '');
+function forward(payload, target, cb){
+  const path = target.path;
   const method = String(payload.method || 'GET').toUpperCase();
   const headers = { 'Content-Type': 'application/json' };
-  if (payload.token) headers['Authorization'] = 'Bearer ' + String(payload.token).slice(0, 512);
+  /* 注意：飞书 user_access_token / tenant_access_token 长度在 1~4KB，绝不能截断，截断即 token 无效 */
+  if (payload.token) {
+    /* 上限 8KB（飞书 token 实测 1~4KB）；切勿截断到几百字符，那会让 token 直接失效 */
+    headers['Authorization'] = 'Bearer ' + String(payload.token).slice(0, 8192);
+  }
   const body = (method === 'POST' && payload.body) ? JSON.stringify(payload.body) : null;
   if (body) headers['Content-Length'] = Buffer.byteLength(body);
-  const req = https.request({ hostname: UPSTREAM, port: 443, path, method, headers, timeout: 25000 }, (fr) => {
+  const req = https.request({ hostname: target.hostname, port: 443, path, method, headers, timeout: 25000 }, (fr) => {
     const chunks = [];
     fr.on('data', c => chunks.push(c));
     fr.on('end', () => cb(null, Buffer.concat(chunks).toString('utf8')));
@@ -93,7 +108,7 @@ const server = http.createServer((req, res) => {
 
   if (u.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    return res.end(JSON.stringify({ ok: true, ts: Date.now() }));
+    return res.end(JSON.stringify({ ok: true, ts: Date.now(), v: 2 }));
   }
   if (u.pathname === '/callback' || u.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -111,12 +126,12 @@ const server = http.createServer((req, res) => {
       let payload;
       try { payload = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
       catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'invalid json' })); }
-      const path = String(payload.path || '');
-      if (!ALLOW_RE.test(path)) {
+      const target = resolveTarget(payload);
+      if (!target) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'path not allowed', path }));
+        return res.end(JSON.stringify({ error: 'path not allowed', path: String(payload.path || ''), host: String(payload.host || 'open') }));
       }
-      forward(payload, (err, bodyText) => {
+      forward(payload, target, (err, bodyText) => {
         if (err) { res.writeHead(502, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'upstream error', msg: err.message })); }
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(bodyText);
