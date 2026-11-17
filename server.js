@@ -82,10 +82,13 @@ function forward(payload, target, cb){
   const path = target.path;
   const method = String(payload.method || 'GET').toUpperCase();
   const headers = { 'Content-Type': 'application/json' };
-  /* 注意：飞书 user_access_token / tenant_access_token 长度在 1~4KB，绝不能截断，截断即 token 无效 */
+  /* 【关键】飞书新版令牌是 JWT，长度可达 8KB 以上（实测 8830 字符）。
+     任何对 token 的截断都会让飞书返回 20005 / 99991668 invalid access token。
+     这里只做「超长则报错」，绝不裁剪。 */
   if (payload.token) {
-    /* 上限 8KB（飞书 token 实测 1~4KB）；切勿截断到几百字符，那会让 token 直接失效 */
-    headers['Authorization'] = 'Bearer ' + String(payload.token).slice(0, 8192);
+    const tk = String(payload.token).trim();
+    if (tk.length > 65536) { return cb(new Error('token too long: ' + tk.length)); }
+    headers['Authorization'] = 'Bearer ' + tk;
   }
   const body = (method === 'POST' && payload.body) ? JSON.stringify(payload.body) : null;
   if (body) headers['Content-Length'] = Buffer.byteLength(body);
@@ -108,7 +111,7 @@ const server = http.createServer((req, res) => {
 
   if (u.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    return res.end(JSON.stringify({ ok: true, ts: Date.now(), v: 2 }));
+    return res.end(JSON.stringify({ ok: true, ts: Date.now(), v: 3, tokenMax: 65536 }));
   }
   if (u.pathname === '/callback' || u.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
